@@ -428,14 +428,21 @@ class _BrowserSession:
         self._last_prompt = None
         return page
 
-    async def _wait_warm(self, page, budget: float = 7.0) -> None:
+    async def _wait_warm(self, page, budget: Optional[float] = None) -> None:
         """Block until the page looks ready to send, capped at `budget` seconds.
 
         Readiness signal: the composer textarea exists AND the page has been up
         for at least WARM_MIN seconds - Duck.ai refuses an instant send while
         its challenge JS is still booting. Falls back to the full budget if the
         probe never goes green, so behaviour can never get WORSE than before.
+
+        `budget` defaults to WARM_MAX but is read at CALL time. As a default
+        argument it would be evaluated once at import, capturing whatever
+        config held then - and it previously was not WARM_MAX at all but a
+        hardcoded 7.0, so DUCKAI_WARM_MAX did nothing.
         """
+        if budget is None:
+            budget = WARM_MAX
         loop = asyncio.get_event_loop()
         deadline = loop.time() + budget
         while loop.time() < deadline:

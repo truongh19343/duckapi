@@ -37,8 +37,15 @@ def _no_network(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
-    """Clear every DUCKAI_*/PORT var so the developer's real .env cannot
-    change a test's outcome. Tests that care set what they need themselves."""
+    """Clear every DUCKAI_*/PORT var so the developer's real .env cannot change
+    a test's outcome.
+
+    Necessary, not just tidy: config.py calls load_dotenv(), which by default
+    does NOT overwrite a variable that is already in os.environ. If this
+    developer's real .env had populated DUCKAI_BASE on first import, a test
+    reloading config under a different cwd would silently keep the old value
+    and pass or fail for the wrong reason.
+    """
     for k in list(os.environ):
         if k.startswith("DUCKAI_") or k == "PORT":
             monkeypatch.delenv(k, raising=False)
@@ -102,7 +109,12 @@ class FakePage:
 
     async def query_selector(self, selector):
         """The readiness probe (_wait_warm) and _trigger_send both look for the
-        composer. A non-None result keeps them off the browser APIs."""
+        composer. A non-None result keeps them off the browser APIs.
+
+        `selector_hits` counts calls so a test can prove the probe did or did
+        not run - that is how the WARM_MIN floor and a zero budget are checked.
+        """
+        self.selector_hits += 1
         return FakeElement()
 
     async def goto(self, url, **kw):
