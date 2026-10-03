@@ -539,6 +539,12 @@ class _BrowserSession:
                     logger.warning("rewritten chat body drew ERR_CHALLENGE; body rewrite disabled")
                     await self._drop_page()
                     raise _RewriteRejected()
+                # Drop the page before surfacing the server error too: ERR_BN_LIMIT
+                # and ERR_CHALLENGE leave the composer mid-turn, and _last_prompt
+                # still points at the previous turn. Keeping both would let the
+                # NEXT request see page_alive=True and type a delta onto a page
+                # Duck.ai has already cut off - a second, silent failure.
+                await self._drop_page()
                 self._raise_err(st["err"])
             new = st.get("text") or ""
             if new:
