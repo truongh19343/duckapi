@@ -78,6 +78,9 @@ supported API, use a provider that offers one.
   sleeping a fixed 7 seconds; first token drops from ~10.2s to ~5.5s
 - **Proxy pool** — rotates across a list of clean exits when one gets banned
 - **Credential masking** — proxy passwords are never exposed via the API
+- **Estimated token usage** — a real `usage` block on every response, counting
+  CJK at ~1 token/char and everything else at ~4 chars/token. See
+  [Token usage](#token-usage) for what it is and is not
 - **Graceful shutdown** — the Stop button drains in-flight streams before
   closing browsers
 - **Zero build step** — pure HTML/CSS/JS, no npm, no CDN
@@ -282,6 +285,26 @@ Set the provider's API host to `http://localhost:8080/v1` and paste your key.
 Because sessions are reused by default, the conversation is kept server-side
 per model, so "new chat" in the GUI maps to a fresh Duck.ai page.
 </details>
+
+### Token usage
+
+Every response carries a `usage` block, and it is an **estimate, not a count**.
+
+Duck.ai's stream does not report token counts, so there is nothing to read
+off the wire and no tokenizer that would know the real ones — the models behind
+Duck.ai are not OpenAI's, so `tiktoken` would give a confident wrong answer.
+The estimate counts CJK characters as roughly one token each (they really are
+close, in BPE vocabularies) and everything else at about four characters per
+token.
+
+It is within roughly 15% for ordinary English and code. Treat it as good enough
+to stop a cost dashboard reading zero, not good enough to bill from. Clients
+that check `usage == 0` to decide whether quota remains will get a different
+answer than they used to.
+
+Streaming responses report usage the same way: OpenAI clients need
+`stream_options: {"include_usage": true}` to get a final chunk carrying it, and
+Anthropic clients read `output_tokens` from the `message_delta` event.
 
 ---
 
