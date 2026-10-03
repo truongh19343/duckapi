@@ -774,53 +774,59 @@ class DuckAISession:
         except Exception as e:
             logger.warning("prewarm failed (%s); serving lazily instead", e)
 
-    async def send(self, prompt: str, rewrite: Optional[dict] = None, max_rotations: int = 2) -> str:
+    async def _rotation_failure(self, idx: int, e: Exception) -> None:
+        """Handle a failed attempt: mark it for rotation, or raise instead.
+
+        One place owns rotation policy, because the three callers used to carry
+        identical copies of it and a fix to one left the other two quietly wrong:
+
+        - DuckAIRateLimit bans that session and returns, so the caller
+          rotates. A ban is per-IP, so the next session is genuinely worth it.
+        - DuckAIError propagates. It is not a ban, so rotating just hits the same
+          failure on the next session and buries the real message.
+        - Anything else is a dead Playwright transport, which is local: reset the
+          session so the next request rebuilds it, then report. No rotation - the
+          browser failed, not the IP.
+        """
+        # RateLimit is a subclass of DuckAIError, so it must be tested first. The
+        # original code got this right for free by ordering its except clauses;
+        # flattening them into isinstance() inverts the check and silently stops
+        # all rotation.
+        if isinstance(e, DuckAIRateLimit):
+            self._sessions.get(idx).banned = True
+            return
+        if isinstance(e, DuckAIError):
+            raise e
+        await self._sessions[idx]._reset()
+        raise DuckAIError(f"browser transport failed: {e}") from e
+
+    async def _with_rotation(self, op, max_rotations: int):
+        """Run `op(session)` until it returns without raising a ban."""
         last_err: Optional[Exception] = None
         for _ in range(max(1, max_rotations)):
             idx = self._next_proxy_index()
             if idx is None:
                 raise DuckAIRateLimit("all sessions failed (Duck.ai ban)")
             try:
-                return await (await self._session_for(idx)).send_ui(prompt, self.timeout, rewrite)
-            except DuckAIRateLimit as e:
+                return await op(await self._session_for(idx))
+            except Exception as e:  # noqa: BLE001 - policy lives in _rotation_failure
+                await self._rotation_failure(idx, e)
                 last_err = e
-                self._sessions.get(idx).banned = True
-                continue
-            except DuckAIError:
-                raise
-            except Exception as e:  # playwright transport died - rebuild, surface as 502
-                await self._sessions[idx]._reset()
-                raise DuckAIError(f"browser transport failed: {e}")
         raise last_err or DuckAIRateLimit("all sessions failed")
+
+    async def send(self, prompt: str, rewrite: Optional[dict] = None, max_rotations: int = 2) -> str:
+        async def op(s):
+            return await s.send_ui(prompt, self.timeout, rewrite)
+
+        return await self._with_rotation(op, max_rotations)
 
     async def send_stream(self, prompt: str, rewrite: Optional[dict] = None, max_rotations: int = 2) -> AsyncIterator[str]:
-        """Stream the assistant reply token-by-token (real incremental SSE)."""
-        last_err: Optional[Exception] = None
-        for _ in range(max(1, max_rotations)):
-            idx = self._next_proxy_index()
-            if idx is None:
-                raise DuckAIRateLimit("all sessions failed (Duck.ai ban)")
-            try:
-                async for tok in (await self._session_for(idx)).send_stream_ui(prompt, self.timeout, rewrite):
-                    yield tok
-                return
-            except DuckAIRateLimit as e:
-                last_err = e
-                self._sessions.get(idx).banned = True
-                continue
-            except DuckAIError:
-                raise
-            except Exception as e:
-                await self._sessions[idx]._reset()
-                raise DuckAIError(f"browser transport failed: {e}")
-        raise last_err or DuckAIRateLimit("all sessions failed")
+        """Stream the assistant reply token-by-token (real incremental SSE).
 
-    async def send_image(self, prompt: str, size: Optional[str] = None, max_rotations: int = 2) -> dict:
-        """Generate an image via Duck.ai's native GenerateImage tool.
-
-        Returns {b64, title, gen_prompt, text}. Rotates proxy sessions on ban,
-        mirroring send(). rewrite_model forces the browser page onto this
-        session's model so the tool-invocation reaches the right backend.
+        Its own loop rather than _with_rotation, because a streaming ban only
+        surfaces while iterating - the async generator is created successfully
+        and raises on the first pull. Rotating therefore has to wrap the
+        iteration, not the call. The policy is still _rotation_failure.
         """
         last_err: Optional[Exception] = None
         for _ in range(max(1, max_rotations)):
@@ -828,19 +834,30 @@ class DuckAISession:
             if idx is None:
                 raise DuckAIRateLimit("all sessions failed (Duck.ai ban)")
             try:
-                return await (await self._session_for(idx)).send_image_ui(
-                    prompt, timeout=180.0, size=size, rewrite_model=self.model
-                )
-            except DuckAIRateLimit as e:
+                async for tok in (await self._session_for(idx)).send_stream_ui(
+                        prompt, self.timeout, rewrite):
+                    yield tok
+                return
+            except Exception as e:  # noqa: BLE001 - policy lives in _rotation_failure
+                # CancelledError is a BaseException, so it skips this entirely and
+                # a client that disconnected never gets a second browser turn.
+                await self._rotation_failure(idx, e)
                 last_err = e
-                self._sessions.get(idx).banned = True
-                continue
-            except DuckAIError:
-                raise
-            except Exception as e:
-                await self._sessions[idx]._reset()
-                raise DuckAIError(f"browser transport failed: {e}")
         raise last_err or DuckAIRateLimit("all sessions failed")
+
+    async def send_image(self, prompt: str, size: Optional[str] = None, max_rotations: int = 2) -> dict:
+        """Generate an image via Duck.ai's native GenerateImage tool.
+
+        Returns {b64, title, gen_prompt, text}. rewrite_model forces the browser
+        page onto this session's model so the tool-invocation reaches the right
+        backend.
+        """
+        async def op(s):
+            return await s.send_image_ui(
+                prompt, timeout=180.0, size=size, rewrite_model=self.model
+            )
+
+        return await self._with_rotation(op, max_rotations)
 
     async def close(self) -> None:
         for s in self._sessions.values():
