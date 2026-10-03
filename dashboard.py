@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
+import config
 import duckai
 from duckai import DuckAIError, DuckAIRateLimit
 
@@ -67,24 +68,12 @@ def _mask_proxy(proxy: Optional[str]) -> str:
 
 def _session_state() -> List[dict]:
     """Flatten main._sessions -> DuckAISession -> _BrowserSession into JSON."""
-    # _page_opened_at is asyncio loop time (monotonic), so age must be measured
-    # against time.monotonic() - time.time() would yield a nonsense value.
-    now = time.monotonic()
     out: List[dict] = []
     for model, pool in _sessions().items():
-        for idx, s in getattr(pool, "_sessions", {}).items():
-            proxy = pool.proxies[idx] if idx < len(pool.proxies) else None
-            age = round(now - s._page_opened_at, 1) if s._page_opened_at else None
-            out.append({
-                "model": model,
-                "proxy_index": idx,
-                "proxy": _mask_proxy(proxy),
-                "ready": bool(s._ready),
-                "banned": bool(s.banned),
-                "page_open": s.page is not None,
-                "page_age_s": age,
-                "new_chat": bool(s.new_chat),
-            })
+        for s in pool.debug_state():
+            proxy = pool.proxies[s["proxy_index"]] \
+                if s["proxy_index"] < len(pool.proxies) else None
+            out.append({**s, "model": model, "proxy": _mask_proxy(proxy)})
     return out
 
 
@@ -97,7 +86,7 @@ async def index():
 
 
 @router.get("/api/status")
-async def status():
+async def status(request: Request):
     import main
     pools = _sessions()
     return {
@@ -116,10 +105,16 @@ async def status():
             "models_loaded": len(pools),
         },
         "warm": {
-            "min_s": duckai.WARM_MIN,
-            "max_s": duckai.WARM_MAX,
-            "prewarm": duckai.PREWARM,
+            # Read from config, not duckai.WARM_* - same source of truth as
+            # everything else on this page, and one fewer re-export to keep in
+            # sync.
+            "min_s": config.WARM_MIN,
+            "max_s": config.WARM_MAX,
+            "prewarm": config.PREWARM,
         },
+        # Set when Stop is clicked so the UI can stop pretending the server is
+        # still accepting work; it used to be assigned and never read.
+        "stopping": bool(getattr(request.app.state, "_stopping", False)),
         "sessions": _session_state(),
     }
 

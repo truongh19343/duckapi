@@ -347,11 +347,17 @@ def _clamp_prompt(prompt: str, limit: int) -> str:
 class _BrowserSession:
     """One persistent real-Chrome tab; UI-driven send; SSE response tee-streamed."""
 
-    def __init__(self, model: str, proxy: Optional[str], timeout: float, new_chat: bool = False) -> None:
+    def __init__(self, model: str, proxy: Optional[str], timeout: float,
+                 new_chat: bool = False, cfg=None) -> None:
         self.model = model
         self.proxy = proxy
         self.timeout = timeout
         self.new_chat = new_chat
+        # Config comes from config.py through here, never from os.getenv or a
+        # bare module global - that is how .env went unreadable in the first
+        # place. Injected so tests can drive the warmup budget without patching
+        # globals; defaults to the loaded module for every real caller.
+        self.cfg = cfg or config
         self._pw = None
         self.browser = None
         self.ctx = None
@@ -442,11 +448,11 @@ class _BrowserSession:
         hardcoded 7.0, so DUCKAI_WARM_MAX did nothing.
         """
         if budget is None:
-            budget = WARM_MAX
+            budget = self.cfg.WARM_MAX
         loop = asyncio.get_event_loop()
         deadline = loop.time() + budget
         while loop.time() < deadline:
-            if loop.time() - self._page_opened_at >= WARM_MIN:
+            if loop.time() - self._page_opened_at >= self.cfg.WARM_MIN:
                 try:
                     if await page.query_selector("textarea") is not None:
                         return
@@ -713,12 +719,18 @@ class DuckAISession:
 
     def __init__(
         self,
-        model: str = DEFAULT_MODEL,
+        model: Optional[str] = None,
         proxies: Optional[List[str]] = None,
         timeout: float = 120.0,
         new_chat: bool = False,
+        cfg=None,
     ) -> None:
-        self.model = model
+        # None, not DEFAULT_MODEL: a default argument binds at import time, so it
+        # would capture whatever config held then. cfg defaults to None for the
+        # same reason and resolves here, where the call actually happens.
+        cfg = cfg or config
+        self.cfg = cfg
+        self.model = model or cfg.DEFAULT_MODEL
         self.timeout = timeout
         self.new_chat = new_chat
         if not proxies:
@@ -745,7 +757,8 @@ class DuckAISession:
     async def _session_for(self, idx: int) -> _BrowserSession:
         if idx not in self._sessions:
             self._sessions[idx] = _BrowserSession(
-                self.model, self.proxies[idx], self.timeout, new_chat=self.new_chat
+                self.model, self.proxies[idx], self.timeout,
+                new_chat=self.new_chat, cfg=self.cfg
             )
         return self._sessions[idx]
 
@@ -760,7 +773,7 @@ class DuckAISession:
         Best-effort - a failure here must not stop the server booting, because
         the lazy path in _session_for still works.
         """
-        if not PREWARM:
+        if not self.cfg.PREWARM:
             return
         t0 = asyncio.get_event_loop().time()
         try:
@@ -858,6 +871,29 @@ class DuckAISession:
             )
 
         return await self._with_rotation(op, max_rotations)
+
+    def debug_state(self) -> List[dict]:
+        """Per-session state for the dashboard.
+
+        The dashboard used to reach into _ready, _page_opened_at, page and
+        new_chat directly, so renaming any of them broke an operator view with a
+        KeyError at request time and nothing else. One method, so this is the only
+        place that shape is defined.
+        """
+        now = asyncio.get_event_loop().time()
+        out: List[dict] = []
+        for idx, s in self._sessions.items():
+            out.append({
+                "proxy_index": idx,
+                "ready": bool(s._ready),
+                "banned": bool(s.banned),
+                "page_open": s.page is not None,
+                # Loop time is monotonic and starts at an arbitrary offset, so
+                # age must be measured against it rather than time.time().
+                "page_age_s": round(now - s._page_opened_at, 1) if s._page_opened_at else None,
+                "new_chat": bool(s.new_chat),
+            })
+        return out
 
     async def close(self) -> None:
         for s in self._sessions.values():

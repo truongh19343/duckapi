@@ -37,6 +37,12 @@ def _pool(session_count=2):
             self.banned = False
             self.resets = 0
             self.closed = False
+            # The real _BrowserSession's shape, so debug_state() sees what it
+            # sees in production rather than whatever the fake happens to have.
+            self._ready = False
+            self._page_opened_at = None
+            self.new_chat = False
+            self.page = None
 
         async def _reset(self):
             self.resets += 1
@@ -191,3 +197,24 @@ def pytest_raises(exc, match=None):
     import at module scope (conftest pulls pytest in anyway)."""
     import pytest
     return pytest.raises(exc, match=match)
+
+class TestDebugState:
+    def test_reports_every_session_without_touching_privates(self):
+        """The dashboard reads this, not _ready/_page_opened_at directly - a
+        rename of any of those broke the operator view at request time."""
+        pool = _pool(session_count=3)
+        pool._sessions[0]._ready = True
+        pool._sessions[1].banned = True
+        pool._sessions[2].page = object()
+
+        state = pool.debug_state()
+        assert [s["proxy_index"] for s in state] == [0, 1, 2]
+        assert state[0]["ready"] is True and state[0]["page_open"] is False
+        assert state[1]["banned"] is True
+        assert state[2]["page_open"] is True
+
+    def test_page_age_is_none_before_a_page_is_opened(self):
+        """_page_opened_at is None, not 0 - round(now - 0) would report the
+        loop's uptime as a page age."""
+        pool = _pool()
+        assert pool.debug_state()[0]["page_age_s"] is None

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from types import SimpleNamespace
 
 import duckai
 from tests.conftest import FakePage
@@ -23,9 +24,26 @@ from tests.conftest import FakePage
 READY = {"n": 1, "text": "hi", "done": False, "err": None}
 
 
-def _session(page_opened_seconds_ago: float):
+def _cfg(warm_max=None, warm_min=None):
+    """A config stand-in carrying only what _wait_warm reads.
+
+    Passing one in is the point of DuckAISession(cfg=...): the warmup budget is
+    a property of the session's config, not of a module global, so a test can set
+    it without monkeypatching duckai and leaking into every other test.
+    """
+    real = duckai.config
+    return SimpleNamespace(
+        WARM_MAX=real.WARM_MAX if warm_max is None else warm_max,
+        WARM_MIN=real.WARM_MIN if warm_min is None else warm_min,
+    )
+
+
+def _session(page_opened_seconds_ago: float, cfg=None):
     """A _BrowserSession with no browser: _wait_warm only touches `page`."""
     s = duckai._BrowserSession.__new__(duckai._BrowserSession)
+    # cfg too: __new__ skips __init__, and _wait_warm reads the warmup budget off
+    # self.cfg rather than a module global, so a session built this way needs one.
+    s.cfg = cfg or duckai.config
     loop = asyncio.get_event_loop()
     s._page_opened_at = loop.time() - page_opened_seconds_ago
     return s
@@ -59,9 +77,7 @@ class TestWarmMaxDrivesTheBudget:
         WARM_MAX` is evaluated once when duckai.py is imported, so it would
         capture whatever config held then and be untestable afterwards.
         """
-        monkeypatch.setattr(duckai, "WARM_MAX", 0.0)
-
-        session = _session(page_opened_seconds_ago=100.0)
+        session = _session(page_opened_seconds_ago=100.0, cfg=_cfg(warm_max=0.0))
         page = FakePage(script=[])
         # No explicit budget: the call must pick up the patched WARM_MAX of 0.
         await asyncio.wait_for(session._wait_warm(page), timeout=2.0)
@@ -72,9 +88,7 @@ class TestWarmMaxDrivesTheBudget:
     async def test_default_budget_follows_a_raised_warm_max(self, monkeypatch):
         """A raised ceiling must not return early. A page that never goes ready
         runs the loop to its deadline, so the elapsed time is the budget."""
-        monkeypatch.setattr(duckai, "WARM_MAX", 0.3)
-
-        session = _session(page_opened_seconds_ago=100.0)
+        session = _session(page_opened_seconds_ago=100.0, cfg=_cfg(warm_max=0.3))
         page = FakePage(script=[])
         page.query_selector = _raise_on_probe(page)
 
@@ -86,8 +100,7 @@ class TestWarmMaxDrivesTheBudget:
 
     async def test_zero_warm_max_means_no_wait_at_all(self, monkeypatch):
         """The extreme: a ceiling of zero polls nothing."""
-        monkeypatch.setattr(duckai, "WARM_MAX", 0.0)
-        session = _session(page_opened_seconds_ago=100.0)
+        session = _session(page_opened_seconds_ago=100.0, cfg=_cfg(warm_max=0.0))
         page = FakePage(script=[])
         page.query_selector = _raise_on_probe(page)
         await asyncio.wait_for(session._wait_warm(page), timeout=2.0)
@@ -148,3 +161,32 @@ class TestFloorAndCeilingTogether:
         page = FakePage(script=[])
         await asyncio.wait_for(session._wait_warm(page, budget=0.0), timeout=2.0)
         assert page.selector_hits == 0
+
+
+class TestConfigIsInjected:
+    """The original .env bug was env read at import in one module and after
+    load_dotenv in another. The fix is config.py plus injection, so this pins the
+    injection - a future fifth WARM_* read as a bare global would bring the whole
+    class of bug back."""
+
+    def test_default_model_resolves_at_call_time(self):
+        """Not a default argument. `model=DEFAULT_MODEL` binds at import and
+        would capture whatever config held then, which is the same trap the
+        warmup budget had."""
+        cfg = SimpleNamespace(DEFAULT_MODEL="from-injected-config",
+                              PREWARM=False, WARM_MIN=0.0, WARM_MAX=0.0)
+        pool = duckai.DuckAISession(cfg=cfg)
+        assert pool.model == "from-injected-config"
+
+    def test_model_argument_still_wins(self):
+        cfg = SimpleNamespace(DEFAULT_MODEL="ignored", PREWARM=False,
+                              WARM_MIN=0.0, WARM_MAX=0.0)
+        assert duckai.DuckAISession(model="explicit", cfg=cfg).model == "explicit"
+
+    async def test_prewarm_respects_injected_config(self):
+        cfg = SimpleNamespace(DEFAULT_MODEL="m", PREWARM=False,
+                              WARM_MIN=0.0, WARM_MAX=0.0)
+        pool = duckai.DuckAISession(cfg=cfg)
+        # PREWARM off must return without touching a browser at all.
+        await pool.prewarm()
+        assert pool._sessions == {}
