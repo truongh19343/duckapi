@@ -33,24 +33,24 @@ from collections import deque
 from typing import Any, List, Optional, Union
 from uuid import uuid4
 
-from fastapi.responses import JSONResponse, Response, StreamingResponse
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from dotenv import load_dotenv
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
+
+import config
 from duckai import (
     DEFAULT_MODEL,
+    MODEL_LABELS,
     DuckAIError,
     DuckAIRateLimit,
     DuckAISession,
-    MODEL_LABELS,
     fetch_model_catalog,
     resolve_model,
 )
-from tools import split_text_and_tool
 from toolrouter import has_tool_result, route_intent
-
-load_dotenv()
+from tools import split_text_and_tool
+from usage import anthropic_usage, estimate_tokens, openai_usage, responses_usage
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("duckai2api")
@@ -84,18 +84,17 @@ for _name in ("duckai2api", "uvicorn", "uvicorn.error", "uvicorn.access"):
     logging.getLogger(_name).addHandler(_tail)
 logging.getLogger().addHandler(_tail)
 
-API_KEY = os.getenv("DUCKAI_API_KEY", "").strip()
+API_KEY = config.API_KEY
 # Single proxy (DUCKAI_PROXY) or a comma-separated pool (DUCKAI_PROXIES).
 # A pool lets the relay rotate past Duck.ai's per-IP ERR_BN_LIMIT bans.
-_proxy_pool = os.getenv("DUCKAI_PROXIES", "").strip() or os.getenv("DUCKAI_PROXY", "").strip()
-PROXIES = [p.strip() for p in _proxy_pool.split(",") if p.strip()] or None
-DEFAULT = os.getenv("DUCKAI_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
-NEW_CHAT = os.getenv("DUCKAI_NEW_CHAT", "0").strip() == "1"
+PROXIES = config.PROXY_POOL or None
+DEFAULT = config.DEFAULT_MODEL or DEFAULT_MODEL
+NEW_CHAT = config.NEW_CHAT
 # Intent->tool synthesis is a gamble for agent clients (WorkBuddy/Claude Code
 # always send tools + a huge context; a regex mis-hit returns content:null and
 # the IDE reports "no response from model"). Off by default; opt in per deploy.
-TOOL_ROUTING = os.getenv("DUCKAI_TOOL_ROUTING", "0").strip() == "1"
-PORT = int(os.getenv("PORT", "8080"))
+TOOL_ROUTING = config.TOOL_ROUTING
+PORT = config.PORT
 _BOOT_TS = time.time()
 _active_requests = 0
 
@@ -206,6 +205,7 @@ def build_anthropic_prompt(system: Any, messages: List[dict]) -> str:
 app = FastAPI(title="DuckAI2API")
 
 import dashboard  # noqa: E402  - dashboard reads main's globals, so import after them
+
 app.include_router(dashboard.router)
 
 _sessions: dict = {}
@@ -224,7 +224,6 @@ async def _drain_then_exit() -> None:
     Bounded so a wedged stream cannot hold the process open forever; the exit is
     forced once the grace period lapses, which is better than never exiting.
     """
-    import os
     deadline = time.monotonic() + 10
     while _active_requests > 0 and time.monotonic() < deadline:
         await asyncio.sleep(0.1)
@@ -243,8 +242,6 @@ class _ActiveRequestTracker:
     exists, so its finally fires while a StreamingResponse is still going out -
     measured at 2.45s early on a 6-chunk stream. _drain_then_exit would read a
     count of zero and exit mid-answer, cutting the user off mid-sentence.
-    Watching the final http.response.body instead marks the real end of a
-    request, streaming or not.
     """
 
     def __init__(self, app: Any) -> None:
@@ -255,30 +252,20 @@ class _ActiveRequestTracker:
             await self.app(scope, receive, send)
             return
 
+        # `global` here rather than a nested counting_send: releasing the slot
+        # BEFORE awaiting the final write - which is what watching
+        # http.response.body from inside send() did - measures the same thing
+        # BaseHTTPMiddleware does, just later. The write is still on the socket
+        # while the count reads zero. Awaiting the app to completion is the only
+        # point that is genuinely the end of a request, and it covers the
+        # failure paths too: a crashed generator, a client that vanished, and a
+        # send() that raises all unwind through here exactly once.
         global _active_requests
         _active_requests += 1
-        released = False
-
-        async def counting_send(message) -> None:
-            # `global` is needed here too, not just in __call__: a nested
-            # function that assigns _active_requests makes it local to itself,
-            # and the += would raise UnboundLocalError.
-            global _active_requests
-            nonlocal released
-            # more_body is True for every chunk but the last; that last one is
-            # the only reliable "this request is done" signal.
-            if message["type"] == "http.response.body" and not message.get("more_body", False):
-                released = True
-                _active_requests -= 1
-            await send(message)
-
         try:
-            await self.app(scope, receive, counting_send)
+            await self.app(scope, receive, send)
         finally:
-            if not released:
-                # The request errored or the client vanished before the last
-                # body, so nothing above released the slot.
-                _active_requests -= 1
+            _active_requests -= 1
 
 
 app.add_middleware(_ActiveRequestTracker)
@@ -398,24 +385,38 @@ class ChatCompletionRequest(BaseModel):
     tools: Optional[List[dict]] = None
     reasoning_effort: Optional[str] = None
     duckai: Optional[dict] = None
+    stream_options: Optional[dict] = None
 
 
-async def _openai_stream(session: DuckAISession, prompt: str, model: str, chat_id: str, rewrite: Optional[dict] = None):
-    def chunk_obj(delta: dict, finish):
-        return {
+async def _openai_stream(session: DuckAISession, prompt: str, model: str, chat_id: str, rewrite: Optional[dict] = None,
+                         include_usage: bool = False):
+    def chunk_obj(delta: dict, finish, usage=None):
+        obj = {
             "id": chat_id,
             "object": "chat.completion.chunk",
             "created": _created(),
             "model": model,
             "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
         }
+        if usage is not None:
+            obj["usage"] = usage
+        return obj
 
+    yielded: List[str] = []
     try:
         # Strict OpenAI clients expect the first chunk's delta to carry role.
         yield f"data: {json.dumps(chunk_obj({'role': 'assistant', 'content': ''}, None))}\n\n"
         async for token in session.send_stream(prompt, rewrite=rewrite):
+            yielded.append(token)
             yield f"data: {json.dumps(chunk_obj({'content': token}, None))}\n\n"
         yield f"data: {json.dumps(chunk_obj({}, 'stop'))}\n\n"
+        if include_usage:
+            # Per the OpenAI streaming spec, usage rides on a final chunk with an
+            # empty choices array. Without this the counter is invisible on every
+            # streaming request, which is most of them.
+            final = chunk_obj({}, None, openai_usage(prompt, "".join(yielded)))
+            final["choices"] = []
+            yield f"data: {json.dumps(final)}\n\n"
         yield "data: [DONE]\n\n"
     except (DuckAIRateLimit, DuckAIError) as e:
         err = {"error": {"message": str(e), "type": "server_error"}}
@@ -475,7 +476,10 @@ async def chat_completions(request: ChatCompletionRequest):
                     },
                     "finish_reason": "tool_calls",
                 }],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                # Duck.ai was not called on this path, so there is no completion
+                # text. The tool arguments are what the relay produced instead.
+                "usage": openai_usage(
+                    prompt, json.dumps(routed.input, ensure_ascii=False)),
             }
 
     session = await get_session(model)
@@ -483,7 +487,11 @@ async def chat_completions(request: ChatCompletionRequest):
 
     if request.stream:
         return StreamingResponse(
-            _openai_stream(session, prompt, model, _id(), rewrite), media_type="text/event-stream"
+            _openai_stream(
+                session, prompt, model, _id(), rewrite,
+                include_usage=bool((request.stream_options or {}).get("include_usage")),
+            ),
+            media_type="text/event-stream",
         )
 
     try:
@@ -509,7 +517,7 @@ async def chat_completions(request: ChatCompletionRequest):
         "created": _created(),
         "model": model,
         "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "usage": openai_usage(prompt, result),
     }
 
 
@@ -579,7 +587,9 @@ async def openai_responses(request: Request):
                         "name": routed.name,
                         "arguments": json.dumps(routed.input, ensure_ascii=False),
                     }],
-                    "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                    "usage": responses_usage(
+                        "".join(m.get("content") or "" for m in route_msgs),
+                        json.dumps(routed.input, ensure_ascii=False)),
                 }
     if not prompt:
         raise HTTPException(status_code=400, detail="empty input")
@@ -630,7 +640,7 @@ async def openai_responses(request: Request):
             "model": model,
             "status": "completed",
             "output": output,
-            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            "usage": responses_usage(prompt, result),
         }
 
     async def _resp_stream():
@@ -649,7 +659,8 @@ async def openai_responses(request: Request):
     return StreamingResponse(_resp_stream(), media_type="text/event-stream")
 
 
-def _build_anthropic_message(msg_id: str, model: str, result: str, tool_use=None) -> dict:
+def _build_anthropic_message(msg_id: str, model: str, result: str,
+                             prompt: str = "", tool_use=None) -> dict:
     """Build an Anthropic message response.
 
     - If `tool_use` (a RoutedToolCall from the relay router) is given, emit a
@@ -657,6 +668,10 @@ def _build_anthropic_message(msg_id: str, model: str, result: str, tool_use=None
     - Else if the model emitted a <tool_call> envelope (never happens on Duck.ai,
       kept for completeness), parse it.
     - Else return a plain text block.
+
+    `prompt` is the flattened conversation, needed for the usage estimate's
+    input_tokens. It defaults to "" so a caller with no prompt to hand still gets
+    a well-formed response.
     """
     if tool_use is not None:
         return {
@@ -672,7 +687,7 @@ def _build_anthropic_message(msg_id: str, model: str, result: str, tool_use=None
             }],
             "stop_reason": "tool_use",
             "stop_sequence": None,
-            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "usage": anthropic_usage(prompt, result),
         }
     preamble, tc = split_text_and_tool(result)
     if tc is None:
@@ -684,7 +699,7 @@ def _build_anthropic_message(msg_id: str, model: str, result: str, tool_use=None
             "content": [{"type": "text", "text": result.strip()}],
             "stop_reason": "end_turn",
             "stop_sequence": None,
-            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "usage": anthropic_usage(prompt, result),
         }
     content = []
     if preamble:
@@ -703,7 +718,7 @@ def _build_anthropic_message(msg_id: str, model: str, result: str, tool_use=None
         "content": content,
         "stop_reason": "tool_use",
         "stop_sequence": None,
-        "usage": {"input_tokens": 0, "output_tokens": 0},
+        "usage": anthropic_usage(prompt, result),
     }
 
 
@@ -763,7 +778,7 @@ async def anthropic_messages(request: Request):
         routed = route_intent(messages, tools)
         if routed is not None:
             return _build_anthropic_message(
-                f"msg_{uuid4().hex[:24]}", model, "", tool_use=routed
+                f"msg_{uuid4().hex[:24]}", model, "", prompt=prompt, tool_use=routed
             )
     stream = bool(raw.get("stream", False))
     session = await get_session(model)
@@ -781,9 +796,14 @@ async def anthropic_messages(request: Request):
             return _anthropic_error(429, "rate_limit_error", str(e))
         except DuckAIError as e:
             return _anthropic_error(502, "api_error", str(e))
-        return _build_anthropic_message(msg_id, model, result)
+        return _build_anthropic_message(msg_id, model, result, prompt=prompt)
 
     async def _anthropic_stream():
+        # Anthropic's protocol puts input_tokens in message_start and reports
+        # output_tokens only in message_delta, once the reply is complete. The
+        # reply does not exist yet at message_start, so the text is accumulated
+        # here and counted at the end.
+        yielded: List[str] = []
         yield _sse("message_start", {
             "type": "message_start",
             "message": {
@@ -794,7 +814,7 @@ async def anthropic_messages(request: Request):
                 "content": [],
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {"input_tokens": 0, "output_tokens": 0},
+                "usage": anthropic_usage(prompt, None),
             },
         })
         yield _sse("content_block_start", {
@@ -804,6 +824,7 @@ async def anthropic_messages(request: Request):
         })
         try:
             async for token in session.send_stream(prompt, rewrite=rewrite):
+                yielded.append(token)
                 yield _sse("content_block_delta", {
                     "type": "content_block_delta",
                     "index": 0,
@@ -819,7 +840,7 @@ async def anthropic_messages(request: Request):
         yield _sse("message_delta", {
             "type": "message_delta",
             "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-            "usage": {"output_tokens": 0},
+            "usage": {"output_tokens": estimate_tokens("".join(yielded))},
         })
         yield _sse("message_stop", {"type": "message_stop"})
 

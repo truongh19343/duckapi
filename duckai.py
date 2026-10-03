@@ -51,11 +51,15 @@ from typing import AsyncIterator, List, Optional
 
 from playwright.async_api import async_playwright
 
+import config
+
 logger = logging.getLogger("duckai")
 
-BASE = os.getenv("DUCKAI_BASE", "https://duck.ai")
+BASE = config.BASE
 # Use the system Chrome, not Playwright's bundled Chromium (fingerprint reasons above).
-CHROME_PATH = os.getenv("DUCKAI_CHROME_PATH", r"C:\Program Files\Google\Chrome\Application\chrome.exe")
+# An empty CHROME_PATH means "let Playwright find it", which is what non-Windows
+# setups want; the old hardcoded Windows path could never resolve there.
+CHROME_PATH = config.CHROME_PATH
 # A real desktop Chrome UA (no "HeadlessChrome" marker). Version pinned to a common
 # stable release; must NOT contain "HeadlessChrome".
 REAL_UA = (
@@ -317,12 +321,16 @@ _PROMPT_FALLBACK_LIMIT = 12000
 # (measured: ~10s to first token, of which 7s was this sleep). We now poll for
 # readiness with WARM_MIN as a hard floor and WARM_MAX as the deadline, which
 # keeps the anti-ban guarantee but lets a fast page skip straight to ready.
-WARM_MIN = float(os.getenv("DUCKAI_WARM_MIN", "2.0"))
-WARM_MAX = float(os.getenv("DUCKAI_WARM_MAX", "7.0"))
+#
+# Values come from config, which owns .env loading - see that module's docstring
+# for why reading os.getenv here at import time used to silently ignore .env.
+# Re-exported so existing `from duckai import WARM_MIN` callers keep working.
+WARM_MIN = config.WARM_MIN
+WARM_MAX = config.WARM_MAX
 
 # Launch Chrome and warm a page at server startup instead of on first request.
 # Set to 0 to boot lazy (no browser until someone actually asks).
-PREWARM = os.getenv("DUCKAI_PREWARM", "1") not in ("0", "false", "False")
+PREWARM = config.PREWARM
 
 
 def _clamp_prompt(prompt: str, limit: int) -> str:
@@ -420,14 +428,21 @@ class _BrowserSession:
         self._last_prompt = None
         return page
 
-    async def _wait_warm(self, page, budget: float = 7.0) -> None:
+    async def _wait_warm(self, page, budget: Optional[float] = None) -> None:
         """Block until the page looks ready to send, capped at `budget` seconds.
 
         Readiness signal: the composer textarea exists AND the page has been up
         for at least WARM_MIN seconds - Duck.ai refuses an instant send while
         its challenge JS is still booting. Falls back to the full budget if the
         probe never goes green, so behaviour can never get WORSE than before.
+
+        `budget` defaults to WARM_MAX but is read at CALL time. As a default
+        argument it would be evaluated once at import, capturing whatever
+        config held then - and it previously was not WARM_MAX at all but a
+        hardcoded 7.0, so DUCKAI_WARM_MAX did nothing.
         """
+        if budget is None:
+            budget = WARM_MAX
         loop = asyncio.get_event_loop()
         deadline = loop.time() + budget
         while loop.time() < deadline:
@@ -447,6 +462,14 @@ class _BrowserSession:
         exactly what we typed last time, the delta is one `Human:` turn - the page
         already holds the rest as native context. Anything messier -> None (fresh
         full-prompt send), which is always correct, just slower.
+
+        An `Assistant:` line in the delta is expected and harmless: it is the
+        reply we just READ off the page, so typing it again is redundant, not
+        wrong, and staying on the delta path is what makes this ~3s instead of
+        ~10s. A `[tool_result ...]` or `System:` line is not: those carry context
+        the live page has never seen. Typing only the trailing Human turn would
+        drop them silently - Duck.ai never sees the tool output and answers a
+        question about data it was never given.
         """
         if self._last_prompt is None or self.page is None:
             return None
@@ -457,7 +480,14 @@ class _BrowserSession:
         if len(marks) != 1:
             return None
         new_text = tail[marks[0].end():].strip()
-        return new_text or None
+        if not new_text:
+            return None
+        # Everything before the Human turn must be an Assistant echo (already on
+        # the page). A [tool_result ...] or System block here is missing context.
+        for block in tail[:marks[0].start()].strip().split("\n\n"):
+            if block.strip() and not block.startswith("Assistant:"):
+                return None
+        return new_text
 
     async def _trigger_send(self, page, prompt: str) -> None:
         ta = await page.query_selector("textarea")
@@ -524,6 +554,12 @@ class _BrowserSession:
                     logger.warning("rewritten chat body drew ERR_CHALLENGE; body rewrite disabled")
                     await self._drop_page()
                     raise _RewriteRejected()
+                # Drop the page before surfacing the server error too: ERR_BN_LIMIT
+                # and ERR_CHALLENGE leave the composer mid-turn, and _last_prompt
+                # still points at the previous turn. Keeping both would let the
+                # NEXT request see page_alive=True and type a delta onto a page
+                # Duck.ai has already cut off - a second, silent failure.
+                await self._drop_page()
                 self._raise_err(st["err"])
             new = st.get("text") or ""
             if new:
@@ -559,10 +595,20 @@ class _BrowserSession:
         for attempt in (0, 1):
             try:
                 async with self._lock:
-                    async for ev in self._iter_events(prompt, timeout, rewrite):
-                        msg = ev.get("message")
-                        if msg:
-                            yield msg
+                    try:
+                        async for ev in self._iter_events(prompt, timeout, rewrite):
+                            msg = ev.get("message")
+                            if msg:
+                                yield msg
+                    except asyncio.CancelledError:
+                        # The client hung up. The lock is released by the async
+                        # with either way, but the page is left mid-turn in the
+                        # composer - and _last_prompt still points at the previous
+                        # turn, so the next request would see page_alive=True and
+                        # append a delta to a page Duck.ai is still filling in.
+                        # Same reason the server-error path drops the page.
+                        await self._drop_page()
+                        raise
                 return
             except _RewriteRejected:
                 if attempt == 0 and rewrite:

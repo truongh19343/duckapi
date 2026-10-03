@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "duckapi"
+version = "0.2.0"
+description = "OpenAI + Anthropic compatible relay for Duck.ai, driven by a real Chrome"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+
+# Kept in lockstep with requirements.txt, which run.py installs at boot.
+# This table exists so `pip install -e .[dev]` works for development.
+dependencies = [
+    "fastapi==0.115.8",
+    "uvicorn[standard]==0.34.0",
+    "pydantic==2.10.6",
+    "python-dotenv==1.0.1",
+    "playwright==1.49.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.4",
+    "pytest-asyncio==0.25.0",
+    "httpx==0.28.1",
+    "ruff==0.8.6",
+]
+
+[tool.setuptools]
+py-modules = ["main", "duckai", "dashboard", "toolrouter", "tools", "usage", "config", "run"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+# E501 (line length) is left off deliberately: the existing code has long lines
+# and reformatting them all would bury the bug fixes in noise.
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501", "B008"]
+
+[tool.ruff.lint.per-file-ignores]
+# tests/ may import main, which loads dotenv and reads env at import time.
+"tests/*" = ["E402"]

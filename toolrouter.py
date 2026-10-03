@@ -23,7 +23,6 @@ matches, we return None and the request flows to Duck.ai as a normal chat.
 """
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import dataclass
 from typing import List, Optional
@@ -78,7 +77,9 @@ def _bash_args(text: str) -> Optional[dict]:
     # "run: cmd" / "execute cmd" / "run the command cmd" -> explicit prefix, take as-is
     m = re.search(r'\b(?:run|execute)\b\s*(?:the\s+)?(?:command\s+)?[:`"\'"]?\s*([^`"\'"\n]{2,300})', text, re.IGNORECASE)
     if m:
-        cmd = m.group(1).strip().strip('`"\'"')
+        # No quote stripping: the capture class already excludes backticks and
+        # quotes, so a strip() here could only ever remove whitespace.
+        cmd = m.group(1).strip()
         if cmd:
             return {"command": cmd}
     return None
@@ -98,27 +99,67 @@ def _glob_args(text: str) -> Optional[dict]:
         return {"pattern": m.group(1)}
     return None
 
+_GREP_VERB = r'\b(?:grep|search\s+for(?:\s+the)?|find)(?:\s+for)?\b'
+# A clause ends at sentence punctuation followed by a space or end-of-string.
+# Requiring that space is what keeps "auth.py" and "app/main.py" intact - a
+# bare '.' boundary cut every filename in half.
+_CLAUSE_END = r'(?:\s*[.?!;](?:\s|$)|$)'
+_STRIP = '`"\''
+_STOPWORDS = ("the", "a", "an", "that", "this", "of", "file", "files", "directory")
+
+
+def _clean_path(raw: str) -> str:
+    """Reduce a path phrase to the token that actually names a path.
+
+    "the auth module" is not a directory, but "module" is the last word of the
+    phrase and is what the caller meant. Taking the first token instead yielded
+    'the', and a wrong path is indistinguishable from a missing one downstream:
+    Grep reports no match either way, so the agent just sees silence.
+    """
+    tokens = [t for t in raw.strip().split() if t.lower() not in _STOPWORDS]
+    if not tokens:
+        return ""
+    return tokens[-1].strip(_STRIP)
+
+
 def _grep_args(text: str) -> Optional[dict]:
-    # quoted: grep "TODO" in src/ | search for 'pattern' in path
-    m = re.search(r'\b(?:grep|search\s+for|find)\b[^`"\'"]*?["\']([^"\']+)["\']', text, re.IGNORECASE)
-    if not m:
-        # unquoted: grab token(s) between the verb and "in/under/within"
-        m = re.search(r'\b(?:grep|search\s+for)\b\s+([^\s`"\'"]+)(?:\s+(?:in|under|within)\s+([`"\'"]?[^\s`"\'"]+[`"\'"]?))?', text, re.IGNORECASE)
-        if m:
-            pattern = m.group(1)
-            path = m.group(2)
-            args = {"pattern": pattern}
-            if path:
-                args["path"] = path.strip('`"\'"')
-            return args
+    """Best-effort pattern/path out of a natural phrasing.
+
+    This is a heuristic, not a parser: it hands a route to a tool the agent then
+    runs itself, and a slightly-off path produces a "file not found" the agent
+    can react to. Over-engineering it buys nothing and costs false positives.
+    """
+    # Quoted pattern first - unambiguous, and the only case worth trusting.
+    #   grep "TODO" in src/  |  search for 'password' in auth.py
+    m = re.search(rf'{_GREP_VERB}[^`"\']*?["\']([^"\']+)["\']'
+                  rf'(?:\s+(?:in|under|within)\s+(.+?){_CLAUSE_END})?',
+                  text, re.IGNORECASE)
     if m:
-        pattern = m.group(1)
-        path_m = re.search(r'\b(?:in|under|within)\s+([`"\'"]?[^\s`"\'"]+[`"\'"]?)', text, re.IGNORECASE)
-        args = {"pattern": pattern}
-        if path_m:
-            args["path"] = path_m.group(1).strip('`"\'"')
-        return args
-    return None
+        pattern, path_raw = m.group(1), m.group(2)
+    else:
+        # Unquoted, split in two steps rather than one regex. A single pattern
+        # with an optional trailing group makes (.+?) match the shortest thing
+        # it can get away with - "grep TODO" parsed as pattern='T'. Ask for the
+        # path form first; only if there is no path phrase, take the rest.
+        m = re.search(rf'{_GREP_VERB}\s+(.+?)\s+(?:in|under|within)\s+(.+?){_CLAUSE_END}',
+                      text, re.IGNORECASE)
+        if m:
+            pattern, path_raw = m.group(1), m.group(2)
+        else:
+            m = re.search(rf'{_GREP_VERB}\s+(.+?){_CLAUSE_END}', text, re.IGNORECASE)
+            if not m:
+                return None
+            pattern, path_raw = m.group(1), None
+
+    pattern = (pattern or "").strip()
+    if not pattern:
+        return None
+    args = {"pattern": pattern}
+    if path_raw:
+        path = _clean_path(path_raw)
+        if path:
+            args["path"] = path
+    return args
 
 
 def _webfetch_args(text: str) -> Optional[dict]:
