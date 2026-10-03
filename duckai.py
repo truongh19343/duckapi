@@ -595,10 +595,20 @@ class _BrowserSession:
         for attempt in (0, 1):
             try:
                 async with self._lock:
-                    async for ev in self._iter_events(prompt, timeout, rewrite):
-                        msg = ev.get("message")
-                        if msg:
-                            yield msg
+                    try:
+                        async for ev in self._iter_events(prompt, timeout, rewrite):
+                            msg = ev.get("message")
+                            if msg:
+                                yield msg
+                    except asyncio.CancelledError:
+                        # The client hung up. The lock is released by the async
+                        # with either way, but the page is left mid-turn in the
+                        # composer - and _last_prompt still points at the previous
+                        # turn, so the next request would see page_alive=True and
+                        # append a delta to a page Duck.ai is still filling in.
+                        # Same reason the server-error path drops the page.
+                        await self._drop_page()
+                        raise
                 return
             except _RewriteRejected:
                 if attempt == 0 and rewrite:
