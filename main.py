@@ -36,8 +36,9 @@ from uuid import uuid4
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from dotenv import load_dotenv
 from pydantic import BaseModel
+
+import config
 from duckai import (
     DEFAULT_MODEL,
     DuckAIError,
@@ -49,8 +50,6 @@ from duckai import (
 )
 from tools import split_text_and_tool
 from toolrouter import has_tool_result, route_intent
-
-load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("duckai2api")
@@ -84,18 +83,17 @@ for _name in ("duckai2api", "uvicorn", "uvicorn.error", "uvicorn.access"):
     logging.getLogger(_name).addHandler(_tail)
 logging.getLogger().addHandler(_tail)
 
-API_KEY = os.getenv("DUCKAI_API_KEY", "").strip()
+API_KEY = config.API_KEY
 # Single proxy (DUCKAI_PROXY) or a comma-separated pool (DUCKAI_PROXIES).
 # A pool lets the relay rotate past Duck.ai's per-IP ERR_BN_LIMIT bans.
-_proxy_pool = os.getenv("DUCKAI_PROXIES", "").strip() or os.getenv("DUCKAI_PROXY", "").strip()
-PROXIES = [p.strip() for p in _proxy_pool.split(",") if p.strip()] or None
-DEFAULT = os.getenv("DUCKAI_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
-NEW_CHAT = os.getenv("DUCKAI_NEW_CHAT", "0").strip() == "1"
+PROXIES = config.PROXY_POOL or None
+DEFAULT = config.DEFAULT_MODEL or DEFAULT_MODEL
+NEW_CHAT = config.NEW_CHAT
 # Intent->tool synthesis is a gamble for agent clients (WorkBuddy/Claude Code
 # always send tools + a huge context; a regex mis-hit returns content:null and
 # the IDE reports "no response from model"). Off by default; opt in per deploy.
-TOOL_ROUTING = os.getenv("DUCKAI_TOOL_ROUTING", "0").strip() == "1"
-PORT = int(os.getenv("PORT", "8080"))
+TOOL_ROUTING = config.TOOL_ROUTING
+PORT = config.PORT
 _BOOT_TS = time.time()
 _active_requests = 0
 

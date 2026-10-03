@@ -51,11 +51,15 @@ from typing import AsyncIterator, List, Optional
 
 from playwright.async_api import async_playwright
 
+import config
+
 logger = logging.getLogger("duckai")
 
-BASE = os.getenv("DUCKAI_BASE", "https://duck.ai")
+BASE = config.BASE
 # Use the system Chrome, not Playwright's bundled Chromium (fingerprint reasons above).
-CHROME_PATH = os.getenv("DUCKAI_CHROME_PATH", r"C:\Program Files\Google\Chrome\Application\chrome.exe")
+# An empty CHROME_PATH means "let Playwright find it", which is what non-Windows
+# setups want; the old hardcoded Windows path could never resolve there.
+CHROME_PATH = config.CHROME_PATH
 # A real desktop Chrome UA (no "HeadlessChrome" marker). Version pinned to a common
 # stable release; must NOT contain "HeadlessChrome".
 REAL_UA = (
@@ -317,12 +321,16 @@ _PROMPT_FALLBACK_LIMIT = 12000
 # (measured: ~10s to first token, of which 7s was this sleep). We now poll for
 # readiness with WARM_MIN as a hard floor and WARM_MAX as the deadline, which
 # keeps the anti-ban guarantee but lets a fast page skip straight to ready.
-WARM_MIN = float(os.getenv("DUCKAI_WARM_MIN", "2.0"))
-WARM_MAX = float(os.getenv("DUCKAI_WARM_MAX", "7.0"))
+#
+# Values come from config, which owns .env loading - see that module's docstring
+# for why reading os.getenv here at import time used to silently ignore .env.
+# Re-exported so existing `from duckai import WARM_MIN` callers keep working.
+WARM_MIN = config.WARM_MIN
+WARM_MAX = config.WARM_MAX
 
 # Launch Chrome and warm a page at server startup instead of on first request.
 # Set to 0 to boot lazy (no browser until someone actually asks).
-PREWARM = os.getenv("DUCKAI_PREWARM", "1") not in ("0", "false", "False")
+PREWARM = config.PREWARM
 
 
 def _clamp_prompt(prompt: str, limit: int) -> str:
