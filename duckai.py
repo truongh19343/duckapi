@@ -447,6 +447,14 @@ class _BrowserSession:
         exactly what we typed last time, the delta is one `Human:` turn - the page
         already holds the rest as native context. Anything messier -> None (fresh
         full-prompt send), which is always correct, just slower.
+
+        An `Assistant:` line in the delta is expected and harmless: it is the
+        reply we just READ off the page, so typing it again is redundant, not
+        wrong, and staying on the delta path is what makes this ~3s instead of
+        ~10s. A `[tool_result ...]` or `System:` line is not: those carry context
+        the live page has never seen. Typing only the trailing Human turn would
+        drop them silently - Duck.ai never sees the tool output and answers a
+        question about data it was never given.
         """
         if self._last_prompt is None or self.page is None:
             return None
@@ -457,7 +465,14 @@ class _BrowserSession:
         if len(marks) != 1:
             return None
         new_text = tail[marks[0].end():].strip()
-        return new_text or None
+        if not new_text:
+            return None
+        # Everything before the Human turn must be an Assistant echo (already on
+        # the page). A [tool_result ...] or System block here is missing context.
+        for block in tail[:marks[0].start()].strip().split("\n\n"):
+            if block.strip() and not block.startswith("Assistant:"):
+                return None
+        return new_text
 
     async def _trigger_send(self, page, prompt: str) -> None:
         ta = await page.query_selector("textarea")
