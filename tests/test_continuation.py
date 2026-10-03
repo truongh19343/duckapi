@@ -8,6 +8,11 @@ Human turn, and the tool output never reached Duck.ai. The model then answered a
 question about a tool result it had never seen, with no error anywhere.
 
 `test_tool_result_forces_resend` is written so it fails against the pre-fix code.
+
+Verified, not asserted: restoring the pre-fix _continuation() (the
+"exactly one ^Human: mark" version) fails 4 of these 17 tests, including
+`test_real_flattened_conversation_with_tool_result`. The other 13 pass on both,
+which is the point - they pin behaviour the fix deliberately left alone.
 """
 from __future__ import annotations
 

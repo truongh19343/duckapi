@@ -12,6 +12,10 @@ careful was dead, and the code that ran was the fallback.
 
 Nothing downstream can tell a wrong path from a missing one: Grep just reports
 no match, so an agent asking to search a directory it named got silence.
+
+Verified, not asserted: restoring the pre-fix _grep_args fails 4 of these 40
+tests, covering both the swapped branches and the article-as-path case. The rest
+pass on both versions.
 """
 from __future__ import annotations
 
