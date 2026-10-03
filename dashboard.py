@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 import duckai
-from duckai import DuckAIRateLimit, DuckAIError
+from duckai import DuckAIError, DuckAIRateLimit
 
 HERE = Path(__file__).resolve().parent
 
@@ -37,6 +37,7 @@ def _require_key(authorization: str = Header(default="")) -> None:
     when DUCKAI_API_KEY is unset, matching every other endpoint.
     """
     from fastapi import HTTPException
+
     from main import API_KEY
     if not API_KEY:
         return
@@ -108,6 +109,11 @@ async def status():
             "new_chat": main.NEW_CHAT,
             "tool_routing": main.TOOL_ROUTING,
             "proxy_count": len(main.PROXIES or []) or 1,
+            # Show what the process actually loaded, not what is in .env. Every
+            # past config bug here was silent - the operator had no way to see
+            # the effective value, only the one they thought they had set.
+            "base_url": main.config.BASE,
+            "models_loaded": len(pools),
         },
         "warm": {
             "min_s": duckai.WARM_MIN,
@@ -138,7 +144,7 @@ async def chat(turn: ChatTurn):
     benchmarked, and this makes the numbers visible per turn.
     """
     import main
-    from duckai import DuckAISession, resolve_model
+    from duckai import resolve_model
 
     if not turn.prompt.strip():
         raise HTTPException(status_code=400, detail="empty prompt")

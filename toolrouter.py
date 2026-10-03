@@ -23,7 +23,6 @@ matches, we return None and the request flows to Duck.ai as a normal chat.
 """
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import dataclass
 from typing import List, Optional
@@ -78,7 +77,9 @@ def _bash_args(text: str) -> Optional[dict]:
     # "run: cmd" / "execute cmd" / "run the command cmd" -> explicit prefix, take as-is
     m = re.search(r'\b(?:run|execute)\b\s*(?:the\s+)?(?:command\s+)?[:`"\'"]?\s*([^`"\'"\n]{2,300})', text, re.IGNORECASE)
     if m:
-        cmd = m.group(1).strip().strip('`"\'"')
+        # No quote stripping: the capture class already excludes backticks and
+        # quotes, so a strip() here could only ever remove whitespace.
+        cmd = m.group(1).strip()
         if cmd:
             return {"command": cmd}
     return None

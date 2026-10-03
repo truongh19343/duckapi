@@ -33,23 +33,23 @@ from collections import deque
 from typing import Any, List, Optional, Union
 from uuid import uuid4
 
-from fastapi.responses import JSONResponse, Response, StreamingResponse
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 import config
 from duckai import (
     DEFAULT_MODEL,
+    MODEL_LABELS,
     DuckAIError,
     DuckAIRateLimit,
     DuckAISession,
-    MODEL_LABELS,
     fetch_model_catalog,
     resolve_model,
 )
-from tools import split_text_and_tool
 from toolrouter import has_tool_result, route_intent
+from tools import split_text_and_tool
 from usage import anthropic_usage, estimate_tokens, openai_usage, responses_usage
 
 logging.basicConfig(level=logging.INFO)
@@ -205,6 +205,7 @@ def build_anthropic_prompt(system: Any, messages: List[dict]) -> str:
 app = FastAPI(title="DuckAI2API")
 
 import dashboard  # noqa: E402  - dashboard reads main's globals, so import after them
+
 app.include_router(dashboard.router)
 
 _sessions: dict = {}
@@ -223,7 +224,6 @@ async def _drain_then_exit() -> None:
     Bounded so a wedged stream cannot hold the process open forever; the exit is
     forced once the grace period lapses, which is better than never exiting.
     """
-    import os
     deadline = time.monotonic() + 10
     while _active_requests > 0 and time.monotonic() < deadline:
         await asyncio.sleep(0.1)
@@ -476,7 +476,10 @@ async def chat_completions(request: ChatCompletionRequest):
                     },
                     "finish_reason": "tool_calls",
                 }],
-                "usage": openai_usage(prompt, result),
+                # Duck.ai was not called on this path, so there is no completion
+                # text. The tool arguments are what the relay produced instead.
+                "usage": openai_usage(
+                    prompt, json.dumps(routed.input, ensure_ascii=False)),
             }
 
     session = await get_session(model)

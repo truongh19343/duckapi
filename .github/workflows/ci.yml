@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One broken OS should not hide the state of the other five.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # requirements.txt FIRST. duckai.py imports playwright at module scope, so
+      # without it every test errors at collection with a ModuleNotFoundError
+      # that looks like a broken test rather than a missing dependency.
+      - run: pip install -r requirements.txt
+      - run: pip install pytest==8.3.4 pytest-asyncio==0.25.0 httpx==0.28.1
+
+      # `python -m pytest`, never bare `pytest`: the latter resolves to whatever
+      # pytest is on PATH, which is not necessarily this interpreter.
+      - run: python -m pytest tests/ -q
+
+      # Import smoke test. main.py imports dashboard after its globals exist, and
+      # dashboard reaches back into main lazily. Nothing in the unit tests covers
+      # that wiring, so it breaks silently until a request arrives.
+      - name: import smoke test
+        run: python -c "import main, duckai, dashboard, tools, toolrouter, usage, config; print('imports ok')"
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: pytest-${{ matrix.os }}-py${{ matrix.python }}
+          path: .pytest_cache/
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff==0.8.6
+      # Not a gate. The repo has ~90 pre-existing style findings (UP006/UP007 on
+      # typing.List, B904 on bare raises) inherited from the original code.
+      # Turning lint into a gate now means either reformatting all of it - which
+      # buries every bug fix in diff noise - or a wall of new ignores. Run it to
+      # see, don't fail on it.
+      - run: ruff check .
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: ruff
+          path: .ruff_cache/

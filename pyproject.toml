@@ -29,7 +29,7 @@ dev = [
 ]
 
 [tool.setuptools]
-py-modules = ["main", "duckai", "dashboard", "toolrouter", "tools", "config", "run"]
+py-modules = ["main", "duckai", "dashboard", "toolrouter", "tools", "usage", "config", "run"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

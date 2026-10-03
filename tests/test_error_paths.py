@@ -21,9 +21,9 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from conftest import FakePage, poll, sse_line
 
 import duckai
-from conftest import FakePage, poll, sse_line
 
 # Mirrors what main.flatten_conversation() actually emits: the delta after a
 # prior turn is one Assistant echo followed by exactly one new Human turn.

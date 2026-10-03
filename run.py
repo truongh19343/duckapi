@@ -76,7 +76,7 @@ def ensure_env() -> None:
     if env.exists():
         return
     shutil.copyfile(ROOT / "example.env", env)
-    print(f"Created .env from example.env (open access, no API key set).")
+    print("Created .env from example.env (open access, no API key set).")
 
 
 def wait_healthy(port: int, timeout: float = 90.0) -> bool:
