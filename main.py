@@ -241,8 +241,6 @@ class _ActiveRequestTracker:
     exists, so its finally fires while a StreamingResponse is still going out -
     measured at 2.45s early on a 6-chunk stream. _drain_then_exit would read a
     count of zero and exit mid-answer, cutting the user off mid-sentence.
-    Watching the final http.response.body instead marks the real end of a
-    request, streaming or not.
     """
 
     def __init__(self, app: Any) -> None:
@@ -253,30 +251,20 @@ class _ActiveRequestTracker:
             await self.app(scope, receive, send)
             return
 
+        # `global` here rather than a nested counting_send: releasing the slot
+        # BEFORE awaiting the final write - which is what watching
+        # http.response.body from inside send() did - measures the same thing
+        # BaseHTTPMiddleware does, just later. The write is still on the socket
+        # while the count reads zero. Awaiting the app to completion is the only
+        # point that is genuinely the end of a request, and it covers the
+        # failure paths too: a crashed generator, a client that vanished, and a
+        # send() that raises all unwind through here exactly once.
         global _active_requests
         _active_requests += 1
-        released = False
-
-        async def counting_send(message) -> None:
-            # `global` is needed here too, not just in __call__: a nested
-            # function that assigns _active_requests makes it local to itself,
-            # and the += would raise UnboundLocalError.
-            global _active_requests
-            nonlocal released
-            # more_body is True for every chunk but the last; that last one is
-            # the only reliable "this request is done" signal.
-            if message["type"] == "http.response.body" and not message.get("more_body", False):
-                released = True
-                _active_requests -= 1
-            await send(message)
-
         try:
-            await self.app(scope, receive, counting_send)
+            await self.app(scope, receive, send)
         finally:
-            if not released:
-                # The request errored or the client vanished before the last
-                # body, so nothing above released the slot.
-                _active_requests -= 1
+            _active_requests -= 1
 
 
 app.add_middleware(_ActiveRequestTracker)
